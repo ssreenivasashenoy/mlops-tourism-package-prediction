@@ -2,9 +2,6 @@ import os
 import pandas as pd
 import joblib
 import mlflow
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.compose import make_column_transformer
-from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import f1_score
 from sklearn.ensemble import RandomForestClassifier
@@ -12,84 +9,106 @@ from xgboost import XGBClassifier
 from huggingface_hub import HfApi, create_repo, hf_hub_download
 from huggingface_hub.utils import RepositoryNotFoundError
 
-# MLflow Setup
-mlflow.set_tracking_uri("http://127.0.0.1:5000")
-mlflow.set_experiment("Tourism-Package-Prediction-Experiment")
-
-# HF API Setup
 HF_USERNAME = "ShenoySreenivas"
 DATASET_NAME = "tourism-data-processed"
+MODEL_REPO = f"{HF_USERNAME}/tourism-package-model"
+
 api = HfApi(token=os.getenv("HF_TOKEN"))
 
-# Download Processed Data
-X_train_path = hf_hub_download(repo_id=f"{HF_USERNAME}/{DATASET_NAME}", filename="X_train.csv", repo_type="dataset")
-X_test_path  = hf_hub_download(repo_id=f"{HF_USERNAME}/{DATASET_NAME}", filename="X_test.csv", repo_type="dataset")
-y_train_path = hf_hub_download(repo_id=f"{HF_USERNAME}/{DATASET_NAME}", filename="y_train.csv", repo_type="dataset")
-y_test_path  = hf_hub_download(repo_id=f"{HF_USERNAME}/{DATASET_NAME}", filename="y_test.csv", repo_type="dataset")
+# MLflow setup
+mlflow.set_tracking_uri("file:./mlruns")
+mlflow.set_experiment("Tourism-Package-Prediction-Experiment")
 
-# Load into DataFrames
-X_train = pd.read_csv(X_train_path)
-X_test  = pd.read_csv(X_test_path)
-y_train = pd.read_csv(y_train_path).values.ravel()
-y_test  = pd.read_csv(y_test_path).values.ravel()
-
-# Preprocessing
-numeric_features = X_train.select_dtypes(include=["int64", "float64"]).columns.tolist()
-categorical_features = X_train.select_dtypes(include=["object"]).columns.tolist()
-
-preprocessor = make_column_transformer(
-    (StandardScaler(), numeric_features),
-    (OneHotEncoder(handle_unknown="ignore"), categorical_features)
+# Download processed train and test datasets from Hugging Face
+train_path = hf_hub_download(
+    repo_id=f"{HF_USERNAME}/{DATASET_NAME}",
+    filename="train.csv",
+    repo_type="dataset"
 )
 
-# Model Dictionary
+test_path = hf_hub_download(
+    repo_id=f"{HF_USERNAME}/{DATASET_NAME}",
+    filename="test.csv",
+    repo_type="dataset"
+)
+
+train_df = pd.read_csv(train_path)
+test_df = pd.read_csv(test_path)
+
+X_train = train_df.drop("ProdTaken", axis=1)
+y_train = train_df["ProdTaken"]
+
+X_test = test_df.drop("ProdTaken", axis=1)
+y_test = test_df["ProdTaken"]
+
+# Define models and hyperparameters
 models = {
     "RandomForest": (
-        RandomForestClassifier(random_state=42),
+        RandomForestClassifier(
+            random_state=42,
+            class_weight="balanced"
+        ),
         {
-            "randomforestclassifier__n_estimators": [100, 200],
-            "randomforestclassifier__max_depth": [5, 10, None]
+            "n_estimators": [200, 300, 500],
+            "max_depth": [None, 10, 20],
+            "min_samples_split": [2, 5, 10],
+            "min_samples_leaf": [1, 2, 4]
         }
     ),
     "XGBoost": (
-        XGBClassifier(eval_metric="logloss", random_state=42),
+        XGBClassifier(
+            eval_metric="logloss",
+            random_state=42,
+            use_label_encoder=False
+        ),
         {
-            "xgbclassifier__n_estimators": [50, 100, 150],
-            "xgbclassifier__max_depth": [2, 4, 6],
-            "xgbclassifier__learning_rate": [0.01, 0.05, 0.1]
+            "n_estimators": [200, 300, 500],
+            "max_depth": [3, 5, 7],
+            "learning_rate": [0.03, 0.05, 0.1],
+            "subsample": [0.8, 1.0],
+            "colsample_bytree": [0.8, 1.0]
         }
     )
 }
 
-best_model, best_name, best_f1 = None, None, -1
+best_model = None
+best_model_name = None
+best_f1 = -1
 
-# Training & MLflow Logging
 with mlflow.start_run():
 
-    for name, (algo, params) in models.items():
-        pipeline = make_pipeline(preprocessor, algo)
-        grid = GridSearchCV(pipeline, params, cv=3, scoring="f1", n_jobs=-1)
+    for model_name, (model, params) in models.items():
+        grid = GridSearchCV(
+            model,
+            params,
+            cv=3,
+            scoring="f1",
+            n_jobs=-1
+        )
+
         grid.fit(X_train, y_train)
 
-        score = f1_score(y_test, grid.best_estimator_.predict(X_test))
+        predictions = grid.best_estimator_.predict(X_test)
+        f1 = f1_score(y_test, predictions)
 
-        mlflow.log_metric(f"{name}_f1", score)
-        mlflow.log_params(grid.best_params_)
+        mlflow.log_metric(f"{model_name}_f1", f1)
 
-        if score > best_f1:
-            best_f1, best_model, best_name = score, grid.best_estimator_, name
+        for param_name, param_value in grid.best_params_.items():
+            mlflow.log_param(f"{model_name}_{param_name}", param_value)
 
-    mlflow.log_param("best_model", best_name)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_model = grid.best_estimator_
+            best_model_name = model_name
+
+    mlflow.log_param("best_model", best_model_name)
     mlflow.log_metric("best_f1_score", best_f1)
 
-    # Save Model
     model_file = "best_tourism_model.pkl"
     joblib.dump(best_model, model_file)
     mlflow.log_artifact(model_file)
 
-    # Upload to HF Model Hub
-    MODEL_REPO = f"{HF_USERNAME}/tourism-package-model"
-
+    # Register model in Hugging Face Model Hub
     try:
         api.repo_info(MODEL_REPO, repo_type="model")
     except RepositoryNotFoundError:
@@ -103,4 +122,5 @@ with mlflow.start_run():
         create_pr=False
     )
 
-print(f"Best Model: {best_name} | F1 Score: {best_f1:.4f}")
+print(f"Best Model: {best_model_name}")
+print(f"Best F1 Score: {best_f1}")
